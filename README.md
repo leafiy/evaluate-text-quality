@@ -1,4 +1,3 @@
-````markdown
 # Text Quality Evaluator  
 文本质量评估器
 
