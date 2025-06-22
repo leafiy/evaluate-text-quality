@@ -1,0 +1,243 @@
+"""
+Text Quality Evaluator – v1.6
+============================
+
+New Feature
+-----------
+* **`duplicate_ngram_ratio`** – detects repetitive *n*-grams (default *n* = 3)
+  across the document.  Highly cloned text blocks (e.g. logs, templates) are
+  flagged and now influence clustering / topic modelling suitability.
+
+Metric definition
+~~~~~~~~~~~~~~~~~
+```
+duplicate_ngram_ratio = (total_ngrams - unique_ngrams) / total_ngrams
+```
+Threshold configurable via `CFG['max_duplicate_ngram_ratio']`.
+
+Impact
+~~~~~~
+* Overall **score** – –5 pts if above threshold.
+* **Clustering / LDA / BERTopic** now also require
+  `duplicate_ngram_ratio` below threshold.
+
+Usage unchanged:
+```python
+from evaluate_text_quality import evaluate_text_quality
+report = evaluate_text_quality("doc.txt")
+print(report["duplicate_ngram_ratio"])
+```
+"""
+from __future__ import annotations
+
+import math
+import re
+from collections import Counter
+from itertools import islice
+from pathlib import Path
+from typing import Dict, Any, Iterable, List
+
+try:
+    from utils.read_txt import read_txt  # project helper
+except ImportError:
+    def read_txt(fp: str | Path) -> str:
+        return Path(fp).read_text(encoding="utf-8", errors="ignore")
+
+STOP_EN = set()
+STOP_ZH = set()
+
+CFG = {
+    # cleanliness
+    "max_symbol_ratio": 0.30,
+    "min_valid_ratio": 0.50,
+    "sentence_len_min": 3,
+    "sentence_len_max": 80,
+    "entropy_low": 3.0,
+    "entropy_high": 5.5,
+    "min_ttr": 0.20,
+    "max_duplicate_line_ratio": 0.10,
+    "max_duplicate_word_ratio": 0.80,
+    # n‑gram
+    "ngram_n": 3,
+    "max_duplicate_ngram_ratio": 0.60,
+    # paragraph / length
+    "max_avg_paragraph_len": 2000,
+    "min_paragraphs": 2,
+    # size for downstream tasks (chars)
+    "min_chars_clustering": 1000,
+    "min_chars_topic": 2000,
+    "min_chars_ner": 500,
+    "min_chars_sentiment": 200,
+    "min_chars_summary": 800,
+}
+
+# ----------------- helpers -----------------
+
+def _entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    cnt = Counter(text)
+    tot = len(text)
+    return -sum((c / tot) * math.log2(c / tot) for c in cnt.values())
+
+
+def _dominant_lang(text: str) -> str:
+    zh = len(re.findall(r"[\u4e00-\u9fff]", text))
+    en = len(re.findall(r"[A-Za-z]", text))
+    if zh and en:
+        return "mixed"
+    if zh:
+        return "zh"
+    if en:
+        return "en"
+    return "unknown"
+
+
+def _ngrams(tokens: List[str], n: int) -> Iterable[tuple[str, ...]]:
+    return (tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1))
+
+# ------------------- main -------------------
+
+def evaluate_text_quality(path: str | Path,name:str) -> Dict[str, Any]:
+    fp = Path(path).expanduser().resolve()
+    if not fp.is_file():
+        raise FileNotFoundError(fp)
+
+    text = read_txt(fp)
+    if not text.strip():
+        return {"char_count": 0, "verdict": "empty", "score": 0}
+
+    # ---------- basic counts ----------
+    char_count = len(text)
+    zh_chars = re.findall(r"[\u4e00-\u9fff]", text)
+    en_chars = re.findall(r"[A-Za-z]", text)
+    digits = re.findall(r"[0-9]", text)
+    symbols = re.findall(r"[^A-Za-z0-9\u4e00-\u9fff\s]", text)
+    punctuation = re.findall(r"[，。！？,.!?；;:—-]", text)
+    uppercase = re.findall(r"[A-Z]", text)
+
+    # ---------- tokens & vocab ----------
+    words = re.findall(r"[A-Za-z]+|[\u4e00-\u9fff]", text)
+    word_count = len(words)
+    vocab = Counter(words)
+    unique_words = len(vocab)
+    hapax = sum(1 for _, c in vocab.items() if c == 1)
+
+    ttr = unique_words / max(1, word_count)
+    duplicate_word_ratio = 1 - ttr
+
+    # n‑gram duplicate ratio
+    n = CFG["ngram_n"]
+    if len(words) >= n:
+        ngrams_list = list(_ngrams(words, n))
+        total_ngrams = len(ngrams_list)
+        unique_ngrams = len(set(ngrams_list))
+        duplicate_ngram_ratio = (total_ngrams - unique_ngrams) / total_ngrams
+    else:
+        duplicate_ngram_ratio = 0.0
+
+    rarity_score = hapax / max(1, unique_words)
+    novelty_index = ttr * rarity_score
+    content_words = [w for w in words if w.lower() not in STOP_EN and w not in STOP_ZH]
+    lexical_density = len(content_words) / max(1, word_count)
+
+    # ---------- structure ----------
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    duplicate_line_ratio = 1 - len(set(lines)) / max(1, len(lines))
+
+    sentences_raw = re.split(r"[。！？.!?]", text)
+    sentences = [s for s in sentences_raw if s.strip()]
+    avg_sentence_len = (
+        sum(len(re.findall(r"[A-Za-z]+|[\u4e00-\u9fff]", s)) for s in sentences) / max(1, len(sentences))
+    )
+    max_sentence_len = max((len(re.findall(r"[A-Za-z]+|[\u4e00-\u9fff]", s)) for s in sentences), default=0)
+    min_sentence_len = min((len(re.findall(r"[A-Za-z]+|[\u4e00-\u9fff]", s)) for s in sentences), default=0)
+
+    paragraphs = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    paragraph_entropy = sum(_entropy(p) for p in paragraphs) / max(1, len(paragraphs))
+    avg_paragraph_len = sum(len(p) for p in paragraphs) / max(1, len(paragraphs))
+    long_line_issue = any(len(ln) > 2000 for ln in text.splitlines())
+
+    # ---------- info metrics ----------
+    doc_entropy = _entropy(text)
+    info_density = doc_entropy / char_count
+    semantic_info = unique_words
+
+    # ---------- ratios ----------
+    symbol_ratio = len(symbols) / char_count
+    valid_ratio = (len(zh_chars) + len(en_chars)) / char_count
+    punctuation_ratio = len(punctuation) / char_count
+    uppercase_ratio = len(uppercase) / max(1, len(en_chars)) if en_chars else 0
+    conciseness_ratio = word_count / char_count
+
+    # ---------- scoring ----------
+    score = 100
+    if symbol_ratio > CFG["max_symbol_ratio"]: score -= 20
+    if valid_ratio < CFG["min_valid_ratio"]: score -= 20
+    if not CFG["sentence_len_min"] <= avg_sentence_len <= CFG["sentence_len_max"]: score -= 10
+    if paragraph_entropy < CFG["entropy_low"] or avg_paragraph_len > CFG["max_avg_paragraph_len"]: score -= 20
+    if paragraph_entropy > CFG["entropy_high"]: score -= 10
+    if ttr < CFG["min_ttr"]: score -= 10
+    if duplicate_line_ratio > CFG["max_duplicate_line_ratio"]: score -= 5
+    if duplicate_word_ratio > CFG["max_duplicate_word_ratio"]: score -= 5
+    if duplicate_ngram_ratio > CFG["max_duplicate_ngram_ratio"]: score -= 5
+    if long_line_issue: score -= 10
+
+    score = max(0, min(100, score))
+    verdict = "good" if score >= 80 else ("fair" if score >= 60 else "poor")
+
+    enough_paragraphs = len(paragraphs) >= CFG["min_paragraphs"]
+    clean_for_cluster = (
+        ttr >= 0.15 and duplicate_line_ratio < 0.2 and duplicate_word_ratio < CFG["max_duplicate_word_ratio"] and duplicate_ngram_ratio < CFG["max_duplicate_ngram_ratio"]
+    )
+
+    suitable_for_clustering = char_count >= CFG["min_chars_clustering"] and clean_for_cluster and enough_paragraphs
+    suitable_for_lda = char_count >= CFG["min_chars_topic"] and clean_for_cluster and enough_paragraphs
+    suitable_for_bertopic = suitable_for_lda
+    suitable_for_ner = char_count >= CFG["min_chars_ner"] and valid_ratio >= 0.6
+    suitable_for_sentiment = char_count >= CFG["min_chars_sentiment"] and len(sentences) >= 3 and valid_ratio >= 0.6
+    suitable_for_summary = char_count >= CFG["min_chars_summary"] and len(sentences) >= 5 and verdict != "poor"
+
+    return {
+        # language & size
+        "dominant_language": _dominant_lang(text),  # 主语言类别
+        "char_count": char_count,  # 字符总数
+        "word_count": word_count,  # 词汇总数
+        # duplication metrics
+        "duplicate_line_ratio": round(duplicate_line_ratio, 4),  # 重复行比例
+        "duplicate_word_ratio": round(duplicate_word_ratio, 4),  # 重复词比例
+        "duplicate_ngram_ratio": round(duplicate_ngram_ratio, 4),  # 重复 n‑gram 比例
+        # ratios & lexical
+        "symbol_ratio": round(symbol_ratio, 4),  # 符号占比
+        "valid_ratio": round(valid_ratio, 4),  # 有效字符占比
+        "punctuation_ratio": round(punctuation_ratio, 4),  # 标点占比
+        "uppercase_ratio": round(uppercase_ratio, 4),  # 大写字母占比
+        "conciseness_ratio": round(conciseness_ratio, 4),  # 简洁性比率（词/字符）
+        "ttr": round(ttr, 4),  # 词类型丰富度
+        "lexical_density": round(lexical_density, 4),  # 词汇密度
+        "rarity_score": round(rarity_score, 4),  # 稀有词得分
+        "novelty_index": round(novelty_index, 4),  # 新颖性指标
+        # paragraph / sentence
+        "paragraph_count": len(paragraphs),  # 段落数量
+        "avg_paragraph_len": round(avg_paragraph_len, 2),  # 平均段落长度
+        "paragraph_entropy": round(paragraph_entropy, 3),  # 段落信息熵
+        "avg_sentence_len": round(avg_sentence_len, 2),  # 平均句长
+        "min_sentence_len": min_sentence_len,  # 最短句长度
+        "max_sentence_len": max_sentence_len,  # 最长句长度
+        # information
+        "doc_entropy": round(doc_entropy, 3),  # 文档信息熵
+        "info_density": round(info_density, 6),  # 信息密度
+        "semantic_info": semantic_info,  # 语义信息量（独特词数）
+        "long_line_issue": long_line_issue,  # 是否存在长行问题
+        # overall
+        "score": score,  # 综合得分
+        "verdict": verdict,  # 质量评价
+        # suitability flags
+        "suitable_for_clustering": suitable_for_clustering,  # 适合聚类
+        "suitable_for_lda": suitable_for_lda,  # 适合 LDA
+        "suitable_for_bertopic": suitable_for_bertopic,  # 适合 BERTopic
+        "suitable_for_ner": suitable_for_ner,  # 适合实体识别
+        "suitable_for_sentiment": suitable_for_sentiment,  # 适合情感分析
+        "suitable_for_summary": suitable_for_summary,  # 适合摘要生成
+    }
+
