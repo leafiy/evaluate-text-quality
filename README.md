@@ -81,6 +81,5 @@ Raw TXT/OCR → evaluate_text_quality → 过滤不合格 → NLP (LDA / BERTopi
 
 * [ ] 多语言停用词支持
 * [ ] IDF-weighted 信息量指标
-* [ ] Web 前端拖拽上传实时评分
 * [ ] 模型（LLM）辅助的语义噪声检测
 
